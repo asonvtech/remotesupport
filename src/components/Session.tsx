@@ -7,8 +7,9 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
-import { ChatMessage, ConnectionStatus } from '../types';
+import Toast from './Toast';
 import Chat from './Chat';
+import { ChatMessage, ConnectionStatus } from '../types';
 
 interface SessionProps {
   roomId: string;
@@ -19,11 +20,17 @@ interface SessionProps {
 export default function Session({ roomId, userName, onLeave }: SessionProps) {
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isAudioOn, setIsAudioOn] = useState(true);
-  const [isVideoOn, setIsVideoOn] = useState(true);
+  const [isVideoOn, setIsVideoOn] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isRemoteMouseDown, setIsRemoteMouseDown] = useState(false);
+
   const [showChat, setShowChat] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [remotePointer, setRemotePointer] = useState<{ x: number, y: number } | null>(null);
+  // For smoothing: the displayed pointer will interpolate towards targetPointerRef.current
+  const displayedPointerRef = useRef<{ x: number, y: number } | null>(null);
+  const targetPointerRef = useRef<{ x: number, y: number } | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const peerRef = useRef<RTCPeerConnection | null>(null);
@@ -31,6 +38,22 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const [remoteRipples, setRemoteRipples] = useState<Array<{ id: number; x: number; y: number }>>([]);
+  const [remoteKey, setRemoteKey] = useState<{ key: string; ts: number } | null>(null);
+  const [hasControl, setHasControl] = useState(false);
+  const [controlRequestFrom, setControlRequestFrom] = useState<string | null>(null);
+
+  const addRemoteRipple = (x: number, y: number) => {
+    const id = Date.now();
+    setRemoteRipples((r) => [...r, { id, x, y }]);
+    // remove after 600ms
+    setTimeout(() => setRemoteRipples((r) => r.filter(rr => rr.id !== id)), 600);
+  };
+
+  const showRemoteKey = (key: string) => {
+    setRemoteKey({ key, ts: Date.now() });
+    setTimeout(() => setRemoteKey(null), 1500);
+  };
 
   useEffect(() => {
     socketRef.current = io();
@@ -63,8 +86,45 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
 
     socket.on('remote-control', ({ from, type, data }) => {
       if (type === 'mousemove') {
-        setRemotePointer(data);
+        // update target pointer for smoothing
+        targetPointerRef.current = data;
+      } else if (type === 'mousedown') {
+        setIsRemoteMouseDown(true);
+        // add a ripple at the pointer location
+        if (data && typeof data.x === 'number' && typeof data.y === 'number') {
+          addRemoteRipple(data.x, data.y);
+        }
+        // also position pointer
+        targetPointerRef.current = data;
+      } else if (type === 'mouseup') {
+        setIsRemoteMouseDown(false);
+        targetPointerRef.current = data;
+      } else if (type === 'keydown' || type === 'keyup') {
+        // show a small key visual near the pointer
+        if (data && data.key) showRemoteKey(data.key);
+        setToastMessage(`Remote ${type}: ${data.key}`);
       }
+    });
+
+    // Control request/respond flow
+    socket.on('control-request', ({ from }: { from: string }) => {
+      // If this client is currently sharing the screen, show a prompt to accept/deny
+      setControlRequestFrom(from);
+    });
+
+    socket.on('control-granted', ({ roomId, from }: { roomId: string; from: string }) => {
+      // This client was granted control
+      setHasControl(true);
+      setToastMessage('Control granted');
+    });
+
+    socket.on('control-denied', ({ roomId, from }: { roomId: string; from: string }) => {
+      setToastMessage('Control request denied');
+    });
+
+    socket.on('control-revoked', ({ roomId, from }: { roomId: string; from: string }) => {
+      if (hasControl) setHasControl(false);
+      setToastMessage('Control revoked');
     });
 
     // Initialize local stream
@@ -77,10 +137,39 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
     };
   }, [roomId]);
 
+  // Interpolation loop for smooth pointer movement
+  useEffect(() => {
+    let rafId: number;
+    const step = () => {
+      const target = targetPointerRef.current;
+      const displayed = displayedPointerRef.current;
+      if (target && (!displayed || displayed.x !== target.x || displayed.y !== target.y)) {
+        if (!displayed) {
+          displayedPointerRef.current = { x: target.x, y: target.y };
+        } else {
+          // ease towards target
+          displayedPointerRef.current = {
+            x: displayed.x + (target.x - displayed.x) * 0.22,
+            y: displayed.y + (target.y - displayed.y) * 0.22,
+          };
+        }
+        setRemotePointer({ ...displayedPointerRef.current! });
+      }
+      rafId = requestAnimationFrame(step);
+    };
+    rafId = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(rafId);
+  }, []);
+
   const initLocalStream = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStreamRef.current = stream;
+      // If video should be off by default, disable video tracks immediately
+      if (!isVideoOn) {
+        stream.getVideoTracks().forEach(t => (t.enabled = false));
+      }
+
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
@@ -175,7 +264,21 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
 
   const startScreenShare = async () => {
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      // Feature-detect getDisplayMedia for browsers/devices that don't support it (e.g., iOS Safari)
+      const hasGetDisplayMedia = typeof (navigator.mediaDevices as any).getDisplayMedia === 'function';
+      let screenStream: MediaStream | null = null;
+
+      if (hasGetDisplayMedia) {
+        screenStream = await (navigator.mediaDevices as any).getDisplayMedia({ video: true });
+      } else {
+        // Fallback: inform the user and try to fall back to camera capture where possible
+        // (true screen capture on mobile browsers is limited/unavailable)
+        alert('Screen sharing is not supported on this device/browser. Falling back to camera capture.');
+        screenStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+
+      if (!screenStream) return;
+
       const videoTrack = screenStream.getVideoTracks()[0];
 
       if (peerRef.current) {
@@ -196,6 +299,7 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
       setIsScreenSharing(true);
     } catch (err) {
       console.error('Error starting screen share:', err);
+      alert('Unable to start screen share on this device/browser.');
     }
   };
 
@@ -224,15 +328,78 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
       const rect = e.currentTarget.getBoundingClientRect();
       const x = (e.clientX - rect.left) / rect.width;
       const y = (e.clientY - rect.top) / rect.height;
-      
-      socketRef.current?.emit('remote-control', {
-        roomId,
-        type: 'mousemove',
-        data: { x, y },
-        to: 'all' // In a 1:1 session this is fine
-      });
+      const payload = { x, y };
+      socketRef.current?.emit('remote-control', { roomId, type: 'mousemove', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'mousemove', data: payload })); } catch {}
     }
   };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (isScreenSharing) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      const payload = { x, y, button: e.button };
+      socketRef.current?.emit('remote-control', { roomId, type: 'mousedown', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'mousedown', data: payload })); } catch {};
+    }
+  };
+
+  const handleMouseUp = (e: React.MouseEvent) => {
+    if (isScreenSharing) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      const payload = { x, y, button: e.button };
+      socketRef.current?.emit('remote-control', { roomId, type: 'mouseup', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'mouseup', data: payload })); } catch {};
+    }
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (isScreenSharing) {
+      const rect = (e.target as HTMLElement).getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      const payload = { x, y, deltaX: e.deltaX, deltaY: e.deltaY };
+      socketRef.current?.emit('remote-control', { roomId, type: 'wheel', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'wheel', data: payload })); } catch {}
+    }
+  };
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    if (isScreenSharing) {
+      e.preventDefault();
+      const rect = (e.target as HTMLElement).getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      const payload = { x, y, button: e.button };
+      socketRef.current?.emit('remote-control', { roomId, type: 'contextmenu', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'contextmenu', data: payload })); } catch {}
+    }
+  };
+
+  // Keyboard events (when screen sharing)
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (!isScreenSharing) return;
+      const payload = { key: ev.key, code: ev.code, altKey: ev.altKey, ctrlKey: ev.ctrlKey, shiftKey: ev.shiftKey };
+      socketRef.current?.emit('remote-control', { roomId, type: 'keydown', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'keydown', data: payload })); } catch {}
+    };
+    const onKeyUp = (ev: KeyboardEvent) => {
+      if (!isScreenSharing) return;
+      const payload = { key: ev.key, code: ev.code, altKey: ev.altKey, ctrlKey: ev.ctrlKey, shiftKey: ev.shiftKey };
+      socketRef.current?.emit('remote-control', { roomId, type: 'keyup', data: payload, to: roomId });
+      try { dataChannelRef.current?.send(JSON.stringify({ type: 'keyup', data: payload })); } catch {}
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [isScreenSharing, roomId]);
 
   return (
     <div className="h-screen flex flex-col bg-[#1a1a1a] text-white overflow-hidden">
@@ -273,6 +440,15 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
           <button className="p-2 rounded-full hover:bg-gray-800 text-gray-400">
             <Settings className="w-5 h-5" />
           </button>
+          {/* Request control button - shown to viewers */}
+          {!isScreenSharing && (
+            <button
+              onClick={() => socketRef.current?.emit('control-request', { roomId })}
+              className={cn("p-2 rounded-full hover:bg-gray-800 text-gray-400")}
+            >
+              Request Control
+            </button>
+          )}
         </div>
       </header>
 
@@ -287,6 +463,10 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
               playsInline 
               className="w-full h-full object-contain"
               onMouseMove={handleMouseMove}
+              onMouseDown={handleMouseDown}
+              onMouseUp={handleMouseUp}
+              onWheel={handleWheel}
+              onContextMenu={handleContextMenu}
             />
             
             {/* Remote Pointer Visualization */}
@@ -302,6 +482,20 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
                   </div>
                 </div>
               </motion.div>
+            )}
+
+            {/* Remote click ripples */}
+            {remoteRipples.map(r => (
+              <div key={r.id} className="absolute top-0 left-0 pointer-events-none z-40" style={{ transform: `translate(${r.x * 100}%, ${r.y * 100}%)` }}>
+                <span className="block w-6 h-6 -translate-x-1/2 -translate-y-1/2 bg-white/30 rounded-full animate-ping" />
+              </div>
+            ))}
+
+            {/* Remote key visual */}
+            {remoteKey && remotePointer && (
+              <div className="absolute z-50 pointer-events-none" style={{ left: `${remotePointer.x * 100}%`, top: `${remotePointer.y * 100}%`, transform: 'translate(-50%,-160%)' }}>
+                <div className="bg-yellow-400 text-black px-2 py-1 rounded text-sm font-semibold drop-shadow">{remoteKey.key}</div>
+              </div>
             )}
 
             {status === 'connecting' && (
@@ -325,6 +519,12 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
               playsInline 
               className="w-full h-full object-cover mirror"
             />
+            {/* Outgoing video indicator */}
+            {!isVideoOn && (
+              <div className="absolute top-2 right-2 bg-red-600 text-white text-xs px-2 py-1 rounded">
+                Video Off
+              </div>
+            )}
             <div className="absolute bottom-2 left-2 bg-black/50 px-2 py-0.5 rounded text-[10px] font-medium">
               You ({userName})
             </div>
@@ -392,7 +592,40 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
           <PhoneOff className="w-5 h-5" />
           End Session
         </button>
+        {/* Release control button when this client has control */}
+        {hasControl && (
+          <button
+            onClick={() => {
+              socketRef.current?.emit('control-release', { roomId, from: socketRef.current?.id });
+              setHasControl(false);
+            }}
+            className="px-4 h-12 rounded-full bg-yellow-500 hover:bg-yellow-600 text-black flex items-center justify-center gap-2 font-medium transition-all"
+          >
+            Release Control
+          </button>
+        )}
       </footer>
+
+  {/* Toast messages */}
+  <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
+      {/* Control request modal (shown to sharer) */}
+      {controlRequestFrom && isScreenSharing && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60">
+          <div className="bg-white text-black p-6 rounded-lg shadow-lg">
+            <p className="mb-4">User <strong>{controlRequestFrom}</strong> is requesting control. Allow?</p>
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => {
+                socketRef.current?.emit('control-response', { roomId, to: controlRequestFrom, accept: false });
+                setControlRequestFrom(null);
+              }} className="px-4 py-2 rounded bg-gray-200">Deny</button>
+              <button onClick={() => {
+                socketRef.current?.emit('control-response', { roomId, to: controlRequestFrom, accept: true });
+                setControlRequestFrom(null);
+              }} className="px-4 py-2 rounded bg-blue-600 text-white">Allow</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <style>{`
         .mirror {
