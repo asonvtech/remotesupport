@@ -39,6 +39,7 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const sharedVideoRef = useRef<HTMLVideoElement>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const peerTargetIdRef = useRef<string | null>(null);
   const sharedStreamRef = useRef<MediaStream | null>(null);
   const [remoteRipples, setRemoteRipples] = useState<Array<{ id: number; x: number; y: number }>>([]);
   const [remoteKey, setRemoteKey] = useState<{ key: string; ts: number } | null>(null);
@@ -187,6 +188,36 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
     }
   };
 
+  const renegotiateConnection = async () => {
+    if (!peerRef.current || !peerTargetIdRef.current || peerRef.current.signalingState !== 'stable') {
+      return;
+    }
+
+    const offer = await peerRef.current.createOffer();
+    await peerRef.current.setLocalDescription(offer);
+    socketRef.current?.emit('offer', {
+      roomId,
+      offer,
+      to: peerTargetIdRef.current,
+    });
+  };
+
+  const replaceOutgoingVideoTrack = async (track: MediaStreamTrack, stream: MediaStream) => {
+    if (!peerRef.current) {
+      return;
+    }
+
+    const sender = peerRef.current.getSenders().find((s) => s.track?.kind === 'video');
+
+    if (sender) {
+      await sender.replaceTrack(track);
+      return;
+    }
+
+    peerRef.current.addTrack(track, stream);
+    await renegotiateConnection();
+  };
+
   const createPeerConnection = (targetId: string) => {
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -220,6 +251,7 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
     };
 
     peerRef.current = pc;
+    peerTargetIdRef.current = targetId;
     return pc;
   };
 
@@ -288,16 +320,11 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
 
       const videoTrack = screenStream.getVideoTracks()[0];
 
-        if (peerRef.current) {
-          const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
-          if (sender) {
-            sender.replaceTrack(videoTrack);
-          }
-        }
+      await replaceOutgoingVideoTrack(videoTrack, screenStream);
 
-        // Store shared stream and show it in the main area locally
-        sharedStreamRef.current = screenStream;
-        if (sharedVideoRef.current) sharedVideoRef.current.srcObject = screenStream;
+      // Store shared stream and show it in the main area locally
+      sharedStreamRef.current = screenStream;
+      if (sharedVideoRef.current) sharedVideoRef.current.srcObject = screenStream;
 
         videoTrack.onended = () => {
           stopScreenShare();
@@ -314,9 +341,8 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
     // Replace the outgoing video track with the camera track (if available)
     if (peerRef.current && localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
-      if (sender && videoTrack) {
-        sender.replaceTrack(videoTrack);
+      if (videoTrack) {
+        await replaceOutgoingVideoTrack(videoTrack, localStreamRef.current);
       }
     }
 
