@@ -37,7 +37,9 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
+  const sharedVideoRef = useRef<HTMLVideoElement>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const sharedStreamRef = useRef<MediaStream | null>(null);
   const [remoteRipples, setRemoteRipples] = useState<Array<{ id: number; x: number; y: number }>>([]);
   const [remoteKey, setRemoteKey] = useState<{ key: string; ts: number } | null>(null);
   const [hasControl, setHasControl] = useState(false);
@@ -59,8 +61,8 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
     socketRef.current = io();
     const socket = socketRef.current;
 
-    socket.emit('join-room', roomId);
-
+    // Register handlers first, then initialize local media and join the room.
+    // This ensures we have local tracks available before creating offers for new peers.
     socket.on('user-joined', (userId) => {
       console.log('User joined:', userId);
       createOffer(userId);
@@ -127,8 +129,12 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
       setToastMessage('Control revoked');
     });
 
-    // Initialize local stream
-    initLocalStream();
+    // Initialize local stream first, then announce join to the room so any
+    // offer/answer exchanges include our local tracks.
+    (async () => {
+      await initLocalStream();
+      socket.emit('join-room', roomId);
+    })();
 
     return () => {
       socket.disconnect();
@@ -171,6 +177,7 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
       }
 
       if (localVideoRef.current) {
+        // localVideoRef should always show the camera (if any)
         localVideoRef.current.srcObject = stream;
       }
       setStatus('idle');
@@ -281,22 +288,22 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
 
       const videoTrack = screenStream.getVideoTracks()[0];
 
-      if (peerRef.current) {
-        const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
-        if (sender) {
-          sender.replaceTrack(videoTrack);
+        if (peerRef.current) {
+          const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
+          if (sender) {
+            sender.replaceTrack(videoTrack);
+          }
         }
-      }
 
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = screenStream;
-      }
+        // Store shared stream and show it in the main area locally
+        sharedStreamRef.current = screenStream;
+        if (sharedVideoRef.current) sharedVideoRef.current.srcObject = screenStream;
 
-      videoTrack.onended = () => {
-        stopScreenShare();
-      };
+        videoTrack.onended = () => {
+          stopScreenShare();
+        };
 
-      setIsScreenSharing(true);
+        setIsScreenSharing(true);
     } catch (err) {
       console.error('Error starting screen share:', err);
       alert('Unable to start screen share on this device/browser.');
@@ -304,18 +311,29 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
   };
 
   const stopScreenShare = async () => {
-    if (localStreamRef.current) {
+    // Replace the outgoing video track with the camera track (if available)
+    if (peerRef.current && localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (peerRef.current) {
-        const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
-        if (sender) {
-          sender.replaceTrack(videoTrack);
-        }
-      }
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = localStreamRef.current;
+      const sender = peerRef.current.getSenders().find(s => s.track?.kind === 'video');
+      if (sender && videoTrack) {
+        sender.replaceTrack(videoTrack);
       }
     }
+
+    // Stop and clear the shared stream locally
+    if (sharedStreamRef.current) {
+      sharedStreamRef.current.getTracks().forEach(t => t.stop());
+      sharedStreamRef.current = null;
+    }
+    if (sharedVideoRef.current) {
+      sharedVideoRef.current.srcObject = null;
+    }
+
+    // Ensure local preview shows camera
+    if (localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+    }
+
     setIsScreenSharing(false);
   };
 
@@ -457,17 +475,32 @@ export default function Session({ roomId, userName, onLeave }: SessionProps) {
         <div className="flex-1 relative bg-black flex items-center justify-center p-4">
           {/* Remote Video (The other person's screen or camera) */}
           <div className="relative w-full h-full max-w-6xl mx-auto rounded-2xl overflow-hidden bg-gray-900 shadow-2xl">
-            <video 
-              ref={remoteVideoRef} 
-              autoPlay 
-              playsInline 
-              className="w-full h-full object-contain"
-              onMouseMove={handleMouseMove}
-              onMouseDown={handleMouseDown}
-              onMouseUp={handleMouseUp}
-              onWheel={handleWheel}
-              onContextMenu={handleContextMenu}
-            />
+            {isScreenSharing ? (
+              <video
+                ref={sharedVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-contain"
+                onMouseMove={handleMouseMove}
+                onMouseDown={handleMouseDown}
+                onMouseUp={handleMouseUp}
+                onWheel={handleWheel}
+                onContextMenu={handleContextMenu}
+              />
+            ) : (
+              <video 
+                ref={remoteVideoRef} 
+                autoPlay 
+                playsInline 
+                className="w-full h-full object-contain"
+                onMouseMove={handleMouseMove}
+                onMouseDown={handleMouseDown}
+                onMouseUp={handleMouseUp}
+                onWheel={handleWheel}
+                onContextMenu={handleContextMenu}
+              />
+            )}
             
             {/* Remote Pointer Visualization */}
             {remotePointer && (
