@@ -1,0 +1,9 @@
+{
+  "name": "RemoteSupport",
+  "description": "A secure remote support application with screen sharing, video/audio calls, and real-time chat.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ]
+}
